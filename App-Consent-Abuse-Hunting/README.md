@@ -1,6 +1,6 @@
 # App Consent Abuse Hunting — Microsoft Sentinel Workbook
 
-A Microsoft Sentinel / Azure Monitor workbook and companion KQL pack for hunting **OAuth application consent abuse** in Microsoft Entra ID.
+A Microsoft Sentinel / Azure Monitor workbook for hunting **OAuth application consent abuse** in Microsoft Entra ID.
 
 The central question it answers: *what did applications actually do — on behalf of users (delegated) or as themselves (app-only) — using the consents they already hold?*
 
@@ -10,7 +10,7 @@ Most consent-abuse tooling stops at "who consented to what." That is the root ca
 |---|---|
 | **Platform** | Microsoft Sentinel / Log Analytics (also loads in Azure Monitor workbooks) |
 | **Author** | Uğur Güdekli |
-| **Files** | `App-Consent-Abuse-Hunting.workbook.json`, `app-consent-abuse-hunting.kql`, `Export-MsFirstPartySPs.ps1` |
+| **Files** | `App-Consent-Abuse-Hunting.workbook.json`, `Export-MsFirstPartySPs.ps1` |
 
 ---
 
@@ -20,7 +20,6 @@ Most consent-abuse tooling stops at "who consented to what." That is the root ca
 - [Data requirements](#data-requirements)
 - [Deployment](#deployment)
 - [Workbook walkthrough](#workbook-walkthrough)
-- [KQL pack](#kql-pack)
 - [Tuning and known limitations](#tuning-and-known-limitations)
 - [MITRE ATT&CK coverage](#mitre-attck-coverage)
 
@@ -121,7 +120,7 @@ Optional parameters:
 |---|---|
 | `-UseDeviceCode` | Sign in with a device code instead of a browser window — useful when the browser keeps choosing the wrong account. Conditional Access may block device-code flow |
 | `-MicrosoftOwnerTenants` | Owner tenant IDs treated as Microsoft. **Replaces** the defaults, so always include `f8cdef31-a31e-4b4a-93e4-5f571e91255a` and `72f988bf-86f1-41af-91ab-2d7cd011db47` alongside any tenant you add |
-| `-Alias` | Watchlist alias. Leave at `MsFirstPartySPs` — the workbook and KQL pack look for that name |
+| `-Alias` | Watchlist alias. Leave at `MsFirstPartySPs` — the workbook looks for that name |
 | `-OutputPath` | CSV file name, relative to the current folder. Default `.\MsFirstPartySPs.csv` |
 
 The CSV contains your tenant's service principal object IDs. Keep it out of source control (this repository's `.gitignore` already excludes `*.csv`).
@@ -156,7 +155,7 @@ Watchlist items take a few minutes to appear. Then run this in **Logs**:
 _GetWatchlist('MsFirstPartySPs') | count
 ```
 
-The count should match the number the script reported. In the workbook, set **Microsoft app filter** to **Watchlist** — first-party apps such as Office 365 Portal and Teams Services should drop out of *App activity* and *Admin actions*. KQL section 0a shows `AlreadyExcluded = true` for covered actors.
+The count should match the number the script reported. In the workbook, set **Microsoft app filter** to **Watchlist** — first-party apps such as Office 365 Portal and Teams Services should drop out of *App activity* and *Admin actions*. The [coverage check](#watchlist-coverage-check) query shows `InWatchlist = true` for covered actors.
 
 #### Maintenance
 
@@ -234,18 +233,6 @@ A caveat on step 3: the fallback to `UniqueTokenIdentifier` when `SessionId` is 
 
 ---
 
-## KQL pack
-
-`app-consent-abuse-hunting.kql` holds the same logic as standalone queries for the Logs blade, ad-hoc hunting, or as a starting point for analytics rules. It is a **superset** of the workbook: sections 1–6 mirror the tabs, and section 7 has no workbook equivalent.
-
-**Section 7 — app-only sign-in baseline.** Builds a per-app set of known source IPs from `ago(30d) .. ago(Lookback)`, then diffs the current window against it with `set_difference()` to surface service principals authenticating from IPs they have never used. This is the cheapest available detection for a stolen client secret: the app is unchanged and its permissions are unchanged, but it is suddenly signing in from somewhere new. Worth promoting to a scheduled rule once the baseline is tuned.
-
-**Section 0a — app actor discovery.** Lists every app that initiated changes in `AuditLogs` over 30 days, with its `AppId`, its tenant-specific `ServicePrincipalId`, and `AlreadyExcluded` — whether the watchlist (and built-in list, if enabled) covers it. Use it to find Microsoft actors the watchlist missed (see [Microsoft app filter](#microsoft-app-filter)).
-
-Each query is self-contained apart from the shared `let` block at the top (`Lookback`, `HighRiskPerms`, `MsFilterMode`, `BuiltInMsApps`, the watchlist lookup, `ExcludedMsApps`, `ExcludedMsSPIds`, `AppNames`) — paste that above whichever query you are running. Set `MsFilterMode` to `"Watchlist"`, `"WatchlistPlusBuiltIn"` or `"Off"` to match the workbook dropdown.
-
----
-
 ## Tuning and known limitations
 
 Read this section before treating any panel as authoritative.
@@ -256,9 +243,7 @@ Read this section before treating any panel as authoritative.
 
 **The Exchange allowlist hides real attacks.** See tab 3. It is tuned to cut noise, not to be safe. Widen it only with evidence, and never read that panel in isolation.
 
-**`UniqueTokenId` in KQL section 3.** That column is projected from `MicrosoftGraphActivityLogs`, where the token identifier is `SignInActivityId`; `UniqueTokenIdentifier` belongs to the sign-in tables. Verify against your workspace schema and drop the column if the query errors. The workbook version of the same query omits it and is unaffected.
-
-**`Lookback` versus `{TimeRange}`.** The KQL pack is fixed at `Lookback = 14d`, while the workbook is driven by the time-range parameter. The `AppNames` lookup is pinned to `ago(30d)` in both, independent of the selected range — an app that last signed in more than 30 days ago will show its AppId with a blank name rather than being dropped.
+**App names use a fixed 30-day window.** The `AppNames` lookup is pinned to `ago(30d)`, independent of the selected time range — an app that last signed in more than 30 days ago will show its AppId with a blank name rather than being dropped.
 
 **Cost.** `MicrosoftGraphActivityLogs` is high-volume. Narrow the time range before opening the workbook on a large tenant, and expect the token-chain query to be the most expensive panel — it unions the sign-in tables and performs two joins.
 
@@ -283,7 +268,7 @@ The queries read the watchlist straight from the `Watchlist` table, so a missing
 
 **If a Microsoft actor still appears with the filter on,** its app is owned by a tenant the script does not know about:
 
-1. Run KQL section 0a and note the `AppId` of rows where `AlreadyExcluded` is false.
+1. Run the [coverage check](#watchlist-coverage-check) below and note the `AppId` of rows where `InWatchlist` is false.
 2. Look up the owning tenant: `Get-MgServicePrincipal -Filter "appId eq '<AppId>'" -Property DisplayName, AppOwnerOrganizationId`.
 3. If it is genuinely Microsoft, re-run the script with that tenant added:
 
@@ -293,6 +278,25 @@ The queries read the watchlist straight from the `Watchlist` table, so a missing
    ```
 
 The filter is a noise reduction, not a trust decision. An attacker who adds credentials to a Microsoft-owned service principal, or abuses a managed identity, disappears from the filtered panels.
+
+#### Watchlist coverage check
+
+Run in **Logs** to list every app that initiated changes in `AuditLogs` over 30 days, with its `AppId`, its tenant-specific `ServicePrincipalId`, and whether the watchlist covers it:
+
+```kql
+let Wl = _GetWatchlist('MsFirstPartySPs')
+    | project WlSPId = tostring(column_ifexists("ServicePrincipalId", "")), WlAppId = tostring(column_ifexists("AppId", ""));
+AuditLogs
+| where TimeGenerated > ago(30d)
+| where isnotempty(tostring(InitiatedBy.app.servicePrincipalId)) or isnotempty(tostring(InitiatedBy.app.appId))
+| summarize Events = count(), Operations = make_set(OperationName, 10)
+            by AppName = tostring(InitiatedBy.app.displayName),
+               AppId = tostring(InitiatedBy.app.appId),
+               ServicePrincipalId = tostring(InitiatedBy.app.servicePrincipalId)
+| extend InWatchlist = ServicePrincipalId in ((Wl | where isnotempty(WlSPId) | project WlSPId))
+                    or AppId in ((Wl | where isnotempty(WlAppId) | project WlAppId))
+| order by InWatchlist asc, Events desc
+```
 
 ---
 

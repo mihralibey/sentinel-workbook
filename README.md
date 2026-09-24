@@ -1,6 +1,6 @@
 # Microsoft Sentinel Workbooks
 
-A collection of Microsoft Sentinel / Azure Monitor workbooks for threat hunting and investigation in Microsoft Entra ID and Microsoft 365. Each workbook ships with a companion KQL pack so the same logic can be run ad hoc in the Logs blade or adapted into analytics rules.
+A collection of Microsoft Sentinel / Azure Monitor workbooks for threat hunting and investigation in Microsoft Entra ID and Microsoft 365.
 
 ## Workbooks
 
@@ -14,7 +14,6 @@ A collection of Microsoft Sentinel / Azure Monitor workbooks for threat hunting 
 <Workbook-Name>/
     README.md                     # threat model, data requirements, walkthrough, limitations
     <Workbook-Name>.workbook.json # import via Sentinel > Workbooks > Advanced editor
-    <workbook-name>.kql           # standalone hunting queries
     *.ps1                         # optional setup helpers (e.g. watchlist builders)
 ```
 
