@@ -74,6 +74,8 @@ Missing tables are tolerated rather than fatal: the queries use `union isfuzzy=t
 
 Then set the **Time range** and, optionally, paste an AppId into **App filter** — see the [limitations](#tuning-and-known-limitations) note on which tabs honour that filter.
 
+**Hide known Microsoft apps** (default **Yes**) removes noisy first-party service principals — Office 365 Portal, Teams Services, Azure MFA, Identity Protection, Device Registration Service, Managed Service Identity — from the App activity and both Admin actions panels. Set it to **No** to see everything. See [Microsoft app exclusions](#microsoft-app-exclusions) before relying on it.
+
 ---
 
 ## Workbook walkthrough
@@ -150,7 +152,9 @@ A caveat on step 3: the fallback to `UniqueTokenIdentifier` when `SessionId` is 
 
 **Section 7 — app-only sign-in baseline.** Builds a per-app set of known source IPs from `ago(30d) .. ago(Lookback)`, then diffs the current window against it with `set_difference()` to surface service principals authenticating from IPs they have never used. This is the cheapest available detection for a stolen client secret: the app is unchanged and its permissions are unchanged, but it is suddenly signing in from somewhere new. Worth promoting to a scheduled rule once the baseline is tuned.
 
-Each query is self-contained apart from the shared `let` block at the top (`Lookback`, `HighRiskPerms`, `AppNames`) — paste that above whichever query you are running.
+**Section 0a — app actor discovery.** Lists every app that initiated changes in `AuditLogs` over 30 days, with its `AppId`, its tenant-specific `ServicePrincipalId`, and whether it is already excluded. Use it to populate `ExcludedMsSPIds` (see [Microsoft app exclusions](#microsoft-app-exclusions)).
+
+Each query is self-contained apart from the shared `let` block at the top (`Lookback`, `HighRiskPerms`, `ExcludedMsApps`, `ExcludedMsSPIds`, `AppNames`) — paste that above whichever query you are running.
 
 ---
 
@@ -171,6 +175,15 @@ Read this section before treating any panel as authoritative.
 **Cost.** `MicrosoftGraphActivityLogs` is high-volume. Narrow the time range before opening the workbook on a large tenant, and expect the token-chain query to be the most expensive panel — it unions the sign-in tables and performs two joins.
 
 **Tune before alerting.** Every threshold and allowlist here is written for interactive hunting. Baseline your own tenant's normal app behaviour before promoting any of these to an analytics rule.
+
+### Microsoft app exclusions
+
+Two lists drive the **Hide known Microsoft apps** toggle:
+
+- `ExcludedMsApps` — well-known first-party **AppIds**, identical in every tenant. Applied to App activity (tab 2), Entra audit and Graph admin writes (tab 4).
+- `ExcludedMsSPIds` — **empty by default.** `AuditLogs` often records first-party actors with a null `appId` and only a `servicePrincipalId`, which is unique to your tenant. Run KQL section 0a, confirm each candidate with `Get-MgServicePrincipal -Filter "appId eq '<appId>'"`, then paste the object IDs into this list in every query that declares it. Only the Entra audit panel uses it.
+
+The exclusion is a noise filter, not a trust decision. An attacker who adds credentials to a first-party service principal, or abuses a managed identity, disappears from these panels while the toggle is on. Switch it to **No** during an active investigation. Overview, Consents, Mail and Device-code chain panels are not filtered.
 
 ---
 

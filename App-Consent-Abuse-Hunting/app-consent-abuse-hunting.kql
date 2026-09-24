@@ -27,6 +27,18 @@ let HighRiskPerms = dynamic([
     "User.ReadWrite.All","Group.ReadWrite.All","GroupMember.ReadWrite.All",
     "UserAuthenticationMethod.ReadWrite.All","Policy.ReadWrite.ConditionalAccess",
     "Chat.ReadWrite.All","Contacts.ReadWrite"]);
+// Known Microsoft first-party apps to hide from app-activity and admin results (by AppId)
+let ExcludedMsApps = dynamic([
+    "00000006-0000-0ff1-ce00-000000000000",  // Microsoft Office 365 Portal
+    "cc15fd57-2c6c-4117-a88c-83b1d56b4bbe",  // Microsoft Teams Services
+    "b5a60e17-278b-4c92-a4e2-b9262e66bb28",  // Azure MFA StrongAuthenticationService
+    "a3dfc3c6-2c7d-4f42-aeec-b2877f9bce97",  // Microsoft Azure AD Identity Protection
+    "01cb2876-7ebd-4aa4-9cc9-d28bd4d359a9",  // Device Registration Service
+    "ef5d5c69-a5df-46bb-acaf-426f161a21a2"   // Managed Service Identity
+]);
+// AuditLogs often records these actors with appId = null and only a tenant-specific
+// servicePrincipalId. Run query 0a and paste those object IDs here.
+let ExcludedMsSPIds = dynamic([]);
 // AppId -> display name lookup built from all sign-in tables
 let AppNames = union isfuzzy=true
     (SigninLogs                       | where TimeGenerated > ago(30d) | project AppId, AppName = AppDisplayName),
@@ -34,6 +46,23 @@ let AppNames = union isfuzzy=true
     (AADServicePrincipalSignInLogs    | where TimeGenerated > ago(30d) | project AppId, AppName = ServicePrincipalName)
     | where isnotempty(AppId) and isnotempty(AppName)
     | summarize AppName = take_any(AppName) by AppId;
+
+
+// ---------------------------------------------------------------------
+// 0a. DISCOVERY: which app actors appear in AuditLogs, with appId and the
+//     tenant-specific servicePrincipalId. Use it to fill ExcludedMsSPIds
+//     for rows where appId is empty. Confirm with:
+//     Get-MgServicePrincipal -Filter "appId eq '<appId>'" | Select Id, AppId, DisplayName
+// ---------------------------------------------------------------------
+AuditLogs
+| where TimeGenerated > ago(30d)
+| where isnotempty(tostring(InitiatedBy.app.servicePrincipalId)) or isnotempty(tostring(InitiatedBy.app.appId))
+| summarize Events = count(), Operations = make_set(OperationName, 10)
+            by AppName = tostring(InitiatedBy.app.displayName),
+               AppId = tostring(InitiatedBy.app.appId),
+               ServicePrincipalId = tostring(InitiatedBy.app.servicePrincipalId)
+| extend AlreadyExcluded = AppId in (ExcludedMsApps) or ServicePrincipalId in (ExcludedMsSPIds)
+| order by Events desc
 
 
 // ---------------------------------------------------------------------
@@ -68,6 +97,7 @@ AuditLogs
 // ---------------------------------------------------------------------
 MicrosoftGraphActivityLogs
 | where TimeGenerated > ago(Lookback)
+| where AppId !in (ExcludedMsApps)
 | extend AccessType = iff(isempty(UserId), "App-only", "Delegated (on behalf of user)")
 | extend IsWrite = RequestMethod in ("POST","PATCH","PUT","DELETE")
 | summarize Calls = count(), WriteCalls = countif(IsWrite),
@@ -144,6 +174,7 @@ AuditLogs
 | extend AppName = tostring(InitiatedBy.app.displayName),
          AppId   = tostring(InitiatedBy.app.appId),
          ServicePrincipalId = tostring(InitiatedBy.app.servicePrincipalId)
+| where AppId !in (ExcludedMsApps) and ServicePrincipalId !in (ExcludedMsSPIds)
 | extend Sensitive = OperationName has_any (SensitiveOps)
 | extend Target = strcat(tostring(TargetResources[0].displayName), " ", tostring(TargetResources[0].userPrincipalName))
 | project TimeGenerated, AppName, AppId, ServicePrincipalId, OperationName, Category, Sensitive,
@@ -159,6 +190,7 @@ MicrosoftGraphActivityLogs
 | where TimeGenerated > ago(Lookback)
 | where RequestMethod in ("POST","PATCH","PUT","DELETE")
 | where RequestUri matches regex @"(?i)/(roleManagement|directoryRoles|oauth2PermissionGrants|appRoleAssignments|appRoleAssignedTo|addPassword|addKey|federatedIdentityCredentials|identity/conditionalAccess|policies|domains|authentication/methods|owners)"
+| where AppId !in (ExcludedMsApps)
 | extend AccessType = iff(isempty(UserId), "App-only", "Delegated")
 | extend AdminArea = extract(@"(?i)/(roleManagement|directoryRoles|oauth2PermissionGrants|appRoleAssignments|appRoleAssignedTo|addPassword|addKey|federatedIdentityCredentials|conditionalAccess|policies|domains|authentication|owners)", 1, RequestUri)
 | lookup kind=leftouter AppNames on AppId
