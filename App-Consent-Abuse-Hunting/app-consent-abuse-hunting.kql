@@ -1,0 +1,219 @@
+// =====================================================================
+//  App Consent Abuse Hunting Pack  (Microsoft Sentinel / Log Analytics)
+//  Goal: show what apps did ON BEHALF OF USERS (delegated) or AS THEMSELVES
+//        (app-only) because of existing consents: Mail.Send, admin changes,
+//        and token-to-action correlation for device-code phishing.
+//
+//  Required data connectors / diagnostic settings (Entra ID -> Diagnostic settings):
+//    SigninLogs, AADNonInteractiveUserSignInLogs, AADServicePrincipalSignInLogs,
+//    AuditLogs, MicrosoftGraphActivityLogs  (+ Office 365 connector -> OfficeActivity)
+//  Tables that are missing are tolerated via union isfuzzy / column_ifexists.
+//
+//  Author: Uğur Güdekli  |  Test in your tenant; tune allowlists before alerting.
+// =====================================================================
+
+
+// ---------------------------------------------------------------------
+// 0. Shared helpers  (paste these lets above any query below)
+// ---------------------------------------------------------------------
+let Lookback = 14d;
+// Permissions that let an app read/send mail, change directory, or escalate
+let HighRiskPerms = dynamic([
+    "Mail.Send","Mail.ReadWrite","Mail.Read","MailboxSettings.ReadWrite",
+    "full_access_as_app","full_access_as_user","EWS.AccessAsUser.All",
+    "Files.ReadWrite.All","Sites.FullControl.All","Sites.ReadWrite.All",
+    "Directory.ReadWrite.All","RoleManagement.ReadWrite.Directory",
+    "AppRoleAssignment.ReadWrite.All","Application.ReadWrite.All",
+    "User.ReadWrite.All","Group.ReadWrite.All","GroupMember.ReadWrite.All",
+    "UserAuthenticationMethod.ReadWrite.All","Policy.ReadWrite.ConditionalAccess",
+    "Chat.ReadWrite.All","Contacts.ReadWrite"]);
+// AppId -> display name lookup built from all sign-in tables
+let AppNames = union isfuzzy=true
+    (SigninLogs                       | where TimeGenerated > ago(30d) | project AppId, AppName = AppDisplayName),
+    (AADNonInteractiveUserSignInLogs  | where TimeGenerated > ago(30d) | project AppId, AppName = AppDisplayName),
+    (AADServicePrincipalSignInLogs    | where TimeGenerated > ago(30d) | project AppId, AppName = ServicePrincipalName)
+    | where isnotempty(AppId) and isnotempty(AppName)
+    | summarize AppName = take_any(AppName) by AppId;
+
+
+// ---------------------------------------------------------------------
+// 1. ROOT CAUSE: consents and permission grants  (AuditLogs)
+//    Who granted which app which permissions, admin or user consent.
+// ---------------------------------------------------------------------
+AuditLogs
+| where TimeGenerated > ago(Lookback)
+| where OperationName in ("Consent to application", "Add delegated permission grant",
+                          "Add app role assignment to service principal")
+| extend Actor   = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName))
+| extend ActorIP = tostring(InitiatedBy.user.ipAddress)
+| extend Target  = TargetResources[0]
+| extend TargetApp = tostring(Target.displayName), TargetObjectId = tostring(Target.id)
+| mv-apply p = Target.modifiedProperties on (
+      summarize Props = make_bag(bag_pack(tostring(p.displayName), trim('"', tostring(p.newValue))))
+  )
+| extend IsAdminConsent = tostring(Props["ConsentContext.IsAdminConsent"]),
+         Permissions    = coalesce(tostring(Props["ConsentAction.Permissions"]),
+                                   tostring(Props["DelegatedPermissionGrant.Scope"]),
+                                   tostring(Props["AppRole.Value"]))
+| extend HighRisk = Permissions has_any (HighRiskPerms)
+| project TimeGenerated, OperationName, Actor, ActorIP, TargetApp, TargetObjectId,
+          IsAdminConsent, HighRisk, Permissions, Result, CorrelationId
+| order by HighRisk desc, TimeGenerated desc
+
+
+// ---------------------------------------------------------------------
+// 2. WHAT APPS ACTUALLY DO: Graph activity, delegated vs app-only
+//    UserId empty  => app-only (application permission / Roles)
+//    UserId present => delegated, app acting on behalf of the user (Scopes)
+// ---------------------------------------------------------------------
+MicrosoftGraphActivityLogs
+| where TimeGenerated > ago(Lookback)
+| extend AccessType = iff(isempty(UserId), "App-only", "Delegated (on behalf of user)")
+| extend IsWrite = RequestMethod in ("POST","PATCH","PUT","DELETE")
+| summarize Calls = count(), WriteCalls = countif(IsWrite),
+            FailedCalls = countif(ResponseStatusCode >= 400),
+            Users = dcount(UserId), SourceIPs = dcount(IPAddress),
+            PermissionsUsed = make_set(coalesce(Scopes, Roles), 20),
+            FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated)
+            by AppId, AccessType
+| lookup kind=leftouter AppNames on AppId
+| extend UsesHighRiskPerm = tostring(PermissionsUsed) has_any (HighRiskPerms)
+| project AppName, AppId, AccessType, Calls, WriteCalls, FailedCalls, Users, SourceIPs,
+          UsesHighRiskPerm, PermissionsUsed, FirstSeen, LastSeen
+| order by UsesHighRiskPerm desc, WriteCalls desc
+
+
+// ---------------------------------------------------------------------
+// 3. MAIL SENT BY APPS via Microsoft Graph (sendMail / send / reply / forward)
+//    This is the Mail.Send worm pattern from the QR-code incident.
+// ---------------------------------------------------------------------
+MicrosoftGraphActivityLogs
+| where TimeGenerated > ago(Lookback)
+| where RequestMethod == "POST"
+| where RequestUri matches regex @"(?i)/(sendMail|send|reply|replyAll|forward)(\?|$)"
+| extend AccessType = iff(isempty(UserId), "App-only", "Delegated")
+| extend TargetMailbox = extract(@"(?i)/users/([^/]+)/", 1, RequestUri)
+| lookup kind=leftouter AppNames on AppId
+| project TimeGenerated, AppName, AppId, AccessType, UserId, TargetMailbox, IPAddress,
+          Scopes, Roles, ResponseStatusCode, UserAgent, SignInActivityId, UniqueTokenId, RequestUri
+| order by TimeGenerated desc
+
+
+// ---------------------------------------------------------------------
+// 4. MAIL SENT BY APPS via Exchange audit (OfficeActivity)
+//    Catches EWS / Outlook REST / SMTP-OAuth sends that Graph logs miss.
+//    NOTE: first-party clients (Outlook, OWA) also appear; the allowlist
+//    removes normal clients. Device-code attacks often reuse FIRST-PARTY
+//    client IDs, so pair this with query 6 instead of trusting the allowlist.
+// ---------------------------------------------------------------------
+let NormalMailClients = dynamic([
+    "00000002-0000-0ff1-ce00-000000000000",   // Office 365 Exchange Online (OWA)
+    "d3590ed6-52b3-4102-aeff-aad2292ab01c",   // Microsoft Office
+    "27922004-5251-4030-b22d-91ecd9a37ea4",   // Outlook Mobile
+    "9199bf20-a13f-4107-85dc-02114787ef48",   // One Outlook Web
+    "1fec8e78-bce4-4aaf-ab1b-5451cc387264"]); // Microsoft Teams
+OfficeActivity
+| where TimeGenerated > ago(Lookback)
+| where OfficeWorkload == "Exchange" and Operation in ("Send","SendAs","SendOnBehalf")
+| extend AppId       = tostring(column_ifexists("AppId", "")),
+         ClientAppId = tostring(column_ifexists("ClientAppId", "")),
+         TokenId     = tostring(column_ifexists("UniqueTokenId", ""))
+| extend CallingApp = coalesce(ClientAppId, AppId)
+| where isnotempty(CallingApp) and CallingApp !in (NormalMailClients)
+| lookup kind=leftouter (AppNames | project CallingApp = AppId, AppName) on CallingApp
+| summarize Sends = count(), Mailboxes = dcount(UserId), MailboxList = make_set(UserId, 50),
+            ClientIPs = make_set(ClientIP, 20), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated)
+            by CallingApp, AppName, Operation
+| order by Mailboxes desc
+
+
+// ---------------------------------------------------------------------
+// 5. ADMIN / PRIVILEGED ACTIVITY BY APPS
+//    5a. Entra audit entries initiated by an app (app-only admin changes)
+// ---------------------------------------------------------------------
+let SensitiveOps = dynamic([
+    "Add member to role","Add eligible member to role","Add app role assignment to service principal",
+    "Add delegated permission grant","Consent to application","Add service principal credentials",
+    "Certificates and secrets management","Add owner to application","Add owner to service principal",
+    "Reset user password","Update user","Add user","Delete user","Add member to group",
+    "conditional access policy","Set federation settings on domain","Set domain authentication",
+    "Add unverified domain","Update authorization policy","Add application","Update application"]);
+AuditLogs
+| where TimeGenerated > ago(Lookback)
+| where isnotempty(tostring(InitiatedBy.app.servicePrincipalId)) or isnotempty(tostring(InitiatedBy.app.appId))
+| extend AppName = tostring(InitiatedBy.app.displayName),
+         AppId   = tostring(InitiatedBy.app.appId),
+         ServicePrincipalId = tostring(InitiatedBy.app.servicePrincipalId)
+| extend Sensitive = OperationName has_any (SensitiveOps)
+| extend Target = strcat(tostring(TargetResources[0].displayName), " ", tostring(TargetResources[0].userPrincipalName))
+| project TimeGenerated, AppName, AppId, ServicePrincipalId, OperationName, Category, Sensitive,
+          Target, Result, CorrelationId
+| order by Sensitive desc, TimeGenerated desc
+
+
+// ---------------------------------------------------------------------
+//    5b. Admin writes through Graph (delegated AND app-only)
+//        Role assignments, app credentials, CA policies, auth methods, grants.
+// ---------------------------------------------------------------------
+MicrosoftGraphActivityLogs
+| where TimeGenerated > ago(Lookback)
+| where RequestMethod in ("POST","PATCH","PUT","DELETE")
+| where RequestUri matches regex @"(?i)/(roleManagement|directoryRoles|oauth2PermissionGrants|appRoleAssignments|appRoleAssignedTo|addPassword|addKey|federatedIdentityCredentials|identity/conditionalAccess|policies|domains|authentication/methods|owners)"
+| extend AccessType = iff(isempty(UserId), "App-only", "Delegated")
+| extend AdminArea = extract(@"(?i)/(roleManagement|directoryRoles|oauth2PermissionGrants|appRoleAssignments|appRoleAssignedTo|addPassword|addKey|federatedIdentityCredentials|conditionalAccess|policies|domains|authentication|owners)", 1, RequestUri)
+| lookup kind=leftouter AppNames on AppId
+| project TimeGenerated, AppName, AppId, AccessType, UserId, AdminArea, RequestMethod,
+          ResponseStatusCode, IPAddress, Scopes, Roles, Wids, RequestUri
+| order by TimeGenerated desc
+
+
+// ---------------------------------------------------------------------
+// 6. TOKEN-TO-ACTION CHAIN  (the device-code / QR-code phishing story)
+//    Device-code sign-in -> session -> every token in that session ->
+//    what those tokens did in Graph. Links SignInActivityId (Graph)
+//    to UniqueTokenIdentifier (sign-in logs).
+// ---------------------------------------------------------------------
+//    If SessionId is not populated, falls back to the device-code token itself.
+let SignIns = union isfuzzy=true SigninLogs, AADNonInteractiveUserSignInLogs
+    | where TimeGenerated > ago(Lookback)
+    | extend SessionId      = tostring(column_ifexists("SessionId", "")),
+             TransferMethod = tostring(column_ifexists("OriginalTransferMethod", ""))
+    | extend SessionKey = iff(isempty(SessionId), UniqueTokenIdentifier, SessionId);
+let DeviceCodeSessions = SignIns
+    | where AuthenticationProtocol =~ "deviceCode" or TransferMethod =~ "deviceCodeFlow"
+    | where tostring(ResultType) == "0"
+    | summarize DeviceCodeTime = min(TimeGenerated), DeviceCodeIP = take_any(IPAddress),
+                DeviceCodeApp = take_any(AppDisplayName) by UserPrincipalName, SessionKey;
+let SessionTokens = SignIns
+    | where isnotempty(UniqueTokenIdentifier)
+    | join kind=inner (DeviceCodeSessions | project SessionKey) on SessionKey
+    | distinct SessionKey, UniqueTokenIdentifier;
+MicrosoftGraphActivityLogs
+| where TimeGenerated > ago(Lookback)
+| join kind=inner SessionTokens on $left.SignInActivityId == $right.UniqueTokenIdentifier
+| join kind=inner DeviceCodeSessions on SessionKey
+| extend Action = strcat(RequestMethod, " ", extract(@"(?i)/(?:v1\.0|beta)(/[^?]*)", 1, RequestUri))
+| summarize Calls = count(),
+            MailSends = countif(RequestMethod == "POST" and RequestUri matches regex @"(?i)/(sendMail|send|reply|replyAll|forward)(\?|$)"),
+            Actions = make_set(Action, 25), GraphIPs = make_set(IPAddress, 10),
+            FirstUse = min(TimeGenerated), LastUse = max(TimeGenerated)
+            by UserPrincipalName, DeviceCodeTime, DeviceCodeIP, DeviceCodeApp, AppId, SessionKey
+| order by MailSends desc, Calls desc
+
+
+// ---------------------------------------------------------------------
+// 7. APP-ONLY SIGN-INS with high activity or new IPs (AADServicePrincipalSignInLogs)
+// ---------------------------------------------------------------------
+let Baseline = AADServicePrincipalSignInLogs
+    | where TimeGenerated between (ago(30d) .. ago(Lookback))
+    | summarize KnownIPs = make_set(IPAddress, 200) by AppId;
+AADServicePrincipalSignInLogs
+| where TimeGenerated > ago(Lookback)
+| summarize SignIns = count(), Failures = countif(ResultType != "0"), IPs = make_set(IPAddress, 50),
+            Resources = make_set(ResourceDisplayName, 20), LastSeen = max(TimeGenerated)
+            by ServicePrincipalName, AppId
+| join kind=leftouter Baseline on AppId
+| extend NewIPs = set_difference(IPs, coalesce(KnownIPs, dynamic([])))
+| extend NewIPCount = array_length(NewIPs)
+| project ServicePrincipalName, AppId, SignIns, Failures, NewIPCount, NewIPs, Resources, LastSeen
+| order by NewIPCount desc, SignIns desc
