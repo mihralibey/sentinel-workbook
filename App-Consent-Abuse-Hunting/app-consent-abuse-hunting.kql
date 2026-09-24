@@ -27,8 +27,9 @@ let HighRiskPerms = dynamic([
     "User.ReadWrite.All","Group.ReadWrite.All","GroupMember.ReadWrite.All",
     "UserAuthenticationMethod.ReadWrite.All","Policy.ReadWrite.ConditionalAccess",
     "Chat.ReadWrite.All","Contacts.ReadWrite"]);
-// Known Microsoft first-party apps to hide from app-activity and admin results (by AppId)
-let ExcludedMsApps = dynamic([
+// Microsoft app filter: "Watchlist" (default), "WatchlistPlusBuiltIn", or "Off"
+let MsFilterMode = "Watchlist";
+let BuiltInMsApps = dynamic([                 // global AppIds, identical in every tenant
     "00000006-0000-0ff1-ce00-000000000000",  // Microsoft Office 365 Portal
     "cc15fd57-2c6c-4117-a88c-83b1d56b4bbe",  // Microsoft Teams Services
     "b5a60e17-278b-4c92-a4e2-b9262e66bb28",  // Azure MFA StrongAuthenticationService
@@ -36,9 +37,20 @@ let ExcludedMsApps = dynamic([
     "01cb2876-7ebd-4aa4-9cc9-d28bd4d359a9",  // Device Registration Service
     "ef5d5c69-a5df-46bb-acaf-426f161a21a2"   // Managed Service Identity
 ]);
-// AuditLogs often records these actors with appId = null and only a tenant-specific
-// servicePrincipalId. Run query 0a and paste those object IDs here.
-let ExcludedMsSPIds = dynamic([]);
+// Tenant-specific Microsoft service principals come from the Sentinel watchlist
+// 'MsFirstPartySPs' (columns: ServicePrincipalId, AppId, DisplayName, AppOwnerOrganizationId),
+// built by Export-MsFirstPartySPs.ps1. Missing or empty watchlist => nothing is excluded.
+let MsWatchlist = union isfuzzy=true
+    (_GetWatchlist('MsFirstPartySPs')
+        | project WlSPId  = tostring(column_ifexists("ServicePrincipalId", "")),
+                  WlAppId = tostring(column_ifexists("AppId", ""))),
+    (datatable(WlSPId:string, WlAppId:string)[]);
+let WlAppIds = toscalar(MsWatchlist | where isnotempty(WlAppId) | summarize make_set(WlAppId));
+let WlSPIds  = toscalar(MsWatchlist | where isnotempty(WlSPId)  | summarize make_set(WlSPId));
+let ExcludedMsApps  = case(MsFilterMode == "Off", dynamic([]),
+                           MsFilterMode == "WatchlistPlusBuiltIn", set_union(WlAppIds, BuiltInMsApps),
+                           WlAppIds);
+let ExcludedMsSPIds = iff(MsFilterMode == "Off", dynamic([]), WlSPIds);
 // AppId -> display name lookup built from all sign-in tables
 let AppNames = union isfuzzy=true
     (SigninLogs                       | where TimeGenerated > ago(30d) | project AppId, AppName = AppDisplayName),
@@ -50,8 +62,8 @@ let AppNames = union isfuzzy=true
 
 // ---------------------------------------------------------------------
 // 0a. DISCOVERY: which app actors appear in AuditLogs, with appId and the
-//     tenant-specific servicePrincipalId. Use it to fill ExcludedMsSPIds
-//     for rows where appId is empty. Confirm with:
+//     tenant-specific servicePrincipalId, and whether the watchlist covers
+//     them (AlreadyExcluded). Confirm an actor with:
 //     Get-MgServicePrincipal -Filter "appId eq '<appId>'" | Select Id, AppId, DisplayName
 // ---------------------------------------------------------------------
 AuditLogs
@@ -97,7 +109,7 @@ AuditLogs
 // ---------------------------------------------------------------------
 MicrosoftGraphActivityLogs
 | where TimeGenerated > ago(Lookback)
-| where AppId !in (ExcludedMsApps)
+| where AppId !in (ExcludedMsApps) and ServicePrincipalId !in (ExcludedMsSPIds)
 | extend AccessType = iff(isempty(UserId), "App-only", "Delegated (on behalf of user)")
 | extend IsWrite = RequestMethod in ("POST","PATCH","PUT","DELETE")
 | summarize Calls = count(), WriteCalls = countif(IsWrite),
@@ -190,7 +202,7 @@ MicrosoftGraphActivityLogs
 | where TimeGenerated > ago(Lookback)
 | where RequestMethod in ("POST","PATCH","PUT","DELETE")
 | where RequestUri matches regex @"(?i)/(roleManagement|directoryRoles|oauth2PermissionGrants|appRoleAssignments|appRoleAssignedTo|addPassword|addKey|federatedIdentityCredentials|identity/conditionalAccess|policies|domains|authentication/methods|owners)"
-| where AppId !in (ExcludedMsApps)
+| where AppId !in (ExcludedMsApps) and ServicePrincipalId !in (ExcludedMsSPIds)
 | extend AccessType = iff(isempty(UserId), "App-only", "Delegated")
 | extend AdminArea = extract(@"(?i)/(roleManagement|directoryRoles|oauth2PermissionGrants|appRoleAssignments|appRoleAssignedTo|addPassword|addKey|federatedIdentityCredentials|conditionalAccess|policies|domains|authentication|owners)", 1, RequestUri)
 | lookup kind=leftouter AppNames on AppId

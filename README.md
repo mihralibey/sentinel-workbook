@@ -15,6 +15,7 @@ A collection of Microsoft Sentinel / Azure Monitor workbooks for threat hunting 
     README.md                     # threat model, data requirements, walkthrough, limitations
     <Workbook-Name>.workbook.json # import via Sentinel > Workbooks > Advanced editor
     <workbook-name>.kql           # standalone hunting queries
+    *.ps1                         # optional setup helpers (e.g. watchlist builders)
 ```
 
 ## Importing a workbook

@@ -1,0 +1,2 @@
+# Tenant-specific exports (e.g. MsFirstPartySPs.csv) must not be committed
+*.csv

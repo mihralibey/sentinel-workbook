@@ -10,7 +10,7 @@ Most consent-abuse tooling stops at "who consented to what." That is the root ca
 |---|---|
 | **Platform** | Microsoft Sentinel / Log Analytics (also loads in Azure Monitor workbooks) |
 | **Author** | Uğur Güdekli |
-| **Files** | `App-Consent-Abuse-Hunting.workbook.json`, `app-consent-abuse-hunting.kql` |
+| **Files** | `App-Consent-Abuse-Hunting.workbook.json`, `app-consent-abuse-hunting.kql`, `Export-MsFirstPartySPs.ps1` |
 
 ---
 
@@ -55,6 +55,7 @@ Enable these in **Entra ID → Diagnostic settings**, exporting to the Sentinel 
 | `AADNonInteractiveUserSignInLogs` | App name lookup, device-code sign-ins, token chain | Recommended |
 | `AADServicePrincipalSignInLogs` | App name lookup, app-only sign-in baseline | Recommended |
 | `OfficeActivity` | Exchange sends outside Graph (EWS, REST, SMTP OAuth) | Optional — needs the Office 365 connector |
+| Watchlist `MsFirstPartySPs` | Microsoft app filter on tabs 2 and 4 | Optional — see [Microsoft app watchlist](#optional-microsoft-app-watchlist) |
 
 `MicrosoftGraphActivityLogs` is the one to check first. It is not on by default, it is billed as analytics data, and it is high volume in most tenants. Without it, tabs 2 through 5 return nothing and the workbook reduces to a consent-grant report.
 
@@ -74,7 +75,33 @@ Missing tables are tolerated rather than fatal: the queries use `union isfuzzy=t
 
 Then set the **Time range** and, optionally, paste an AppId into **App filter** — see the [limitations](#tuning-and-known-limitations) note on which tabs honour that filter.
 
-**Hide known Microsoft apps** (default **Yes**) removes noisy first-party service principals — Office 365 Portal, Teams Services, Azure MFA, Identity Protection, Device Registration Service, Managed Service Identity — from the App activity and both Admin actions panels. Set it to **No** to see everything. See [Microsoft app exclusions](#microsoft-app-exclusions) before relying on it.
+### Optional: Microsoft app watchlist
+
+The workbook works without any setup. Without the watchlist, nothing is hidden and Microsoft first-party apps show alongside everything else. To cut that noise, build the `MsFirstPartySPs` watchlist once per tenant:
+
+```powershell
+# Requires Microsoft.Graph.Applications (Application.Read.All)
+# and, for upload, Az.Accounts + Microsoft Sentinel Contributor on the workspace
+.\Export-MsFirstPartySPs.ps1 -WorkspaceResourceId "/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.OperationalInsights/workspaces/<ws>"
+```
+
+The script lists every service principal in the tenant whose `AppOwnerOrganizationId` is a Microsoft tenant, writes `MsFirstPartySPs.csv`, and uploads it as a watchlist. Omit `-WorkspaceResourceId` to write the CSV only, then upload it in **Sentinel → Watchlists → New** with alias `MsFirstPartySPs` and search key `ServicePrincipalId`.
+
+| CSV column | Used for |
+|---|---|
+| `ServicePrincipalId` | Tenant-specific object ID. Matches `AuditLogs` actors that have no `appId` |
+| `AppId` | Global application ID. Matches `MicrosoftGraphActivityLogs` and `AuditLogs` |
+| `DisplayName` | Human review only |
+| `AppOwnerOrganizationId` | Human review only |
+
+After a few minutes, open the workbook and check the status line at the top. It should report the watchlist as loaded with a service-principal count.
+
+Things to know about the script:
+
+- **It replaces the watchlist.** An existing `MsFirstPartySPs` watchlist is deleted before the new one is uploaded. If the upload fails, you are left with no watchlist and the workbook shows all apps until you re-run it or upload the CSV by hand.
+- **`-MicrosoftOwnerTenants` replaces the defaults, it does not add to them.** Include both default tenant IDs (`f8cdef31-a31e-4b4a-93e4-5f571e91255a`, `72f988bf-86f1-41af-91ab-2d7cd011db47`) alongside any tenant you add.
+- **Re-run it periodically.** New Microsoft apps appear in tenants over time and will show in the workbook until the watchlist is refreshed.
+- **Review the CSV before uploading.** See [Microsoft app filter](#microsoft-app-filter) for which apps you may want to remove from it.
 
 ---
 
@@ -152,9 +179,9 @@ A caveat on step 3: the fallback to `UniqueTokenIdentifier` when `SessionId` is 
 
 **Section 7 — app-only sign-in baseline.** Builds a per-app set of known source IPs from `ago(30d) .. ago(Lookback)`, then diffs the current window against it with `set_difference()` to surface service principals authenticating from IPs they have never used. This is the cheapest available detection for a stolen client secret: the app is unchanged and its permissions are unchanged, but it is suddenly signing in from somewhere new. Worth promoting to a scheduled rule once the baseline is tuned.
 
-**Section 0a — app actor discovery.** Lists every app that initiated changes in `AuditLogs` over 30 days, with its `AppId`, its tenant-specific `ServicePrincipalId`, and whether it is already excluded. Use it to populate `ExcludedMsSPIds` (see [Microsoft app exclusions](#microsoft-app-exclusions)).
+**Section 0a — app actor discovery.** Lists every app that initiated changes in `AuditLogs` over 30 days, with its `AppId`, its tenant-specific `ServicePrincipalId`, and `AlreadyExcluded` — whether the watchlist (and built-in list, if enabled) covers it. Use it to find Microsoft actors the watchlist missed (see [Microsoft app filter](#microsoft-app-filter)).
 
-Each query is self-contained apart from the shared `let` block at the top (`Lookback`, `HighRiskPerms`, `ExcludedMsApps`, `ExcludedMsSPIds`, `AppNames`) — paste that above whichever query you are running.
+Each query is self-contained apart from the shared `let` block at the top (`Lookback`, `HighRiskPerms`, `MsFilterMode`, `BuiltInMsApps`, the watchlist lookup, `ExcludedMsApps`, `ExcludedMsSPIds`, `AppNames`) — paste that above whichever query you are running. Set `MsFilterMode` to `"Watchlist"`, `"WatchlistPlusBuiltIn"` or `"Off"` to match the workbook dropdown.
 
 ---
 
@@ -176,14 +203,30 @@ Read this section before treating any panel as authoritative.
 
 **Tune before alerting.** Every threshold and allowlist here is written for interactive hunting. Baseline your own tenant's normal app behaviour before promoting any of these to an analytics rule.
 
-### Microsoft app exclusions
+### Microsoft app filter
 
-Two lists drive the **Hide known Microsoft apps** toggle:
+The **Microsoft app filter** dropdown controls what is hidden from App activity (tab 2) and both Admin actions panels (tab 4). Overview, Consents, Mail and Device-code chain are never filtered.
 
-- `ExcludedMsApps` — well-known first-party **AppIds**, identical in every tenant. Applied to App activity (tab 2), Entra audit and Graph admin writes (tab 4).
-- `ExcludedMsSPIds` — **empty by default.** `AuditLogs` often records first-party actors with a null `appId` and only a `servicePrincipalId`, which is unique to your tenant. Run KQL section 0a, confirm each candidate with `Get-MgServicePrincipal -Filter "appId eq '<appId>'"`, then paste the object IDs into this list in every query that declares it. Only the Entra audit panel uses it.
+| Option | Hides |
+|---|---|
+| **Watchlist (if configured)** — default | AppIds and service principal IDs in `MsFirstPartySPs`. Nothing if the watchlist is missing or empty |
+| **Watchlist + built-in AppIds** | The above, plus six global AppIds: Office 365 Portal, Teams Services, Azure MFA, Identity Protection, Device Registration Service, Managed Service Identity |
+| **Off (show all apps)** | Nothing |
 
-The exclusion is a noise filter, not a trust decision. An attacker who adds credentials to a first-party service principal, or abuses a managed identity, disappears from these panels while the toggle is on. Switch it to **No** during an active investigation. Overview, Consents, Mail and Device-code chain panels are not filtered.
+The status line at the top of the workbook reports which of these is in effect and how many service principals the watchlist loaded. A missing watchlist never breaks the queries; it only means nothing is hidden.
+
+**The filter hides delegated user activity through Microsoft clients, not just background noise.** The watchlist covers *every* Microsoft-owned app in the tenant, and the Graph panels match on `AppId`. That includes public clients attackers routinely use in device-code phishing — Microsoft Graph Command Line Tools, Azure CLI, Azure PowerShell, Microsoft Office, Microsoft Authentication Broker. With the filter on, a phished admin token used through Azure CLI to assign a role will not appear in *Graph admin writes*. Two ways to handle this:
+
+- Set the filter to **Off** whenever you are investigating a specific user or incident, and use the Device-code chain tab (always unfiltered) as the authoritative view.
+- Or remove public-client apps from `MsFirstPartySPs.csv` before uploading, so only background service principals are hidden.
+
+**If a Microsoft actor still appears with the filter on,** its app is owned by a tenant the script does not know about:
+
+1. Run KQL section 0a and note the `AppId` of rows where `AlreadyExcluded` is false.
+2. Look up the owning tenant: `Get-MgServicePrincipal -Filter "appId eq '<AppId>'" -Property DisplayName, AppOwnerOrganizationId`.
+3. If it is genuinely Microsoft, re-run the script with that tenant added: `-MicrosoftOwnerTenants 'f8cdef31-a31e-4b4a-93e4-5f571e91255a','72f988bf-86f1-41af-91ab-2d7cd011db47','<new-tenant-id>'`.
+
+The filter is a noise reduction, not a trust decision. An attacker who adds credentials to a Microsoft-owned service principal, or abuses a managed identity, disappears from the filtered panels.
 
 ---
 
