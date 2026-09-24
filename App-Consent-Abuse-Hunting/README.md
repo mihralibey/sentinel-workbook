@@ -77,15 +77,69 @@ Then set the **Time range** and, optionally, paste an AppId into **App filter** 
 
 ### Optional: Microsoft app watchlist
 
-The workbook works without any setup. Without the watchlist, nothing is hidden and Microsoft first-party apps show alongside everything else. To cut that noise, build the `MsFirstPartySPs` watchlist once per tenant:
+The workbook works without any setup. Without the watchlist, nothing is hidden and Microsoft first-party apps show alongside everything else. To cut that noise, build the `MsFirstPartySPs` watchlist once per tenant with `Export-MsFirstPartySPs.ps1`.
+
+#### 1. Prerequisites
+
+| Need | Details |
+|---|---|
+| PowerShell | Windows PowerShell 5.1 or PowerShell 7 |
+| One sign-in tool | The script uses the first one it finds: **Az.Accounts** (`Install-Module Az.Accounts -Scope CurrentUser`, recommended), **Azure CLI** (`winget install Microsoft.AzureCLI`), or **Microsoft.Graph.Authentication** (`Install-Module Microsoft.Graph.Authentication -Scope CurrentUser`, CSV only — cannot upload) |
+| Directory read | An account in the target tenant that can read service principals. Default member users can; if user directory access is restricted, use **Directory Readers** |
+| Upload rights | **Microsoft Sentinel Contributor** on the workspace (only when using `-WorkspaceResourceId`) |
+
+#### 2. Collect the two IDs
+
+- **Tenant ID** — the GUID from **Entra ID → Overview**, or a verified domain such as `contoso.onmicrosoft.com`.
+- **Workspace resource ID** — **Log Analytics workspace → Overview → JSON View → Resource ID**, or:
+
+  ```powershell
+  (Get-AzOperationalInsightsWorkspace -ResourceGroupName <rg> -Name <ws>).ResourceId
+  # or
+  az monitor log-analytics workspace show -g <rg> -n <ws> --query id -o tsv
+  ```
+
+  It looks like `/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.OperationalInsights/workspaces/<ws>`.
+
+#### 3. Run the script
 
 ```powershell
-# Requires Microsoft.Graph.Applications (Application.Read.All)
-# and, for upload, Az.Accounts + Microsoft Sentinel Contributor on the workspace
-.\Export-MsFirstPartySPs.ps1 -WorkspaceResourceId "/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.OperationalInsights/workspaces/<ws>"
+.\Export-MsFirstPartySPs.ps1 -TenantId <your-tenant-id-or-domain> -WorkspaceResourceId "<Log Analytics workspace resource ID>"
 ```
 
-The script lists every service principal in the tenant whose `AppOwnerOrganizationId` is a Microsoft tenant, writes `MsFirstPartySPs.csv`, and uploads it as a watchlist. Omit `-WorkspaceResourceId` to write the CSV only, then upload it in **Sentinel → Watchlists → New** with alias `MsFirstPartySPs` and search key `ServicePrincipalId`.
+The script:
+
+1. Signs in to the tenant given in `-TenantId` only. It turns off Windows account broker (WAM) sign-in for the process, ignores cached Az contexts and Azure CLI accounts (the CLI runs in a throwaway profile), and checks the `tid` claim of every token. If a token belongs to any other tenant, the script stops before reading or writing anything.
+2. Reads all service principals from Microsoft Graph and keeps those whose `appOwnerOrganizationId` is a Microsoft tenant.
+3. Writes `MsFirstPartySPs.csv` to the current folder.
+4. Deletes any existing `MsFirstPartySPs` watchlist on the workspace and uploads the new one.
+5. Signs out and removes the temporary session.
+
+Optional parameters:
+
+| Parameter | Use |
+|---|---|
+| `-UseDeviceCode` | Sign in with a device code instead of a browser window — useful when the browser keeps choosing the wrong account. Conditional Access may block device-code flow |
+| `-MicrosoftOwnerTenants` | Owner tenant IDs treated as Microsoft. **Replaces** the defaults, so always include `f8cdef31-a31e-4b4a-93e4-5f571e91255a` and `72f988bf-86f1-41af-91ab-2d7cd011db47` alongside any tenant you add |
+| `-Alias` | Watchlist alias. Leave at `MsFirstPartySPs` — the workbook and KQL pack look for that name |
+| `-OutputPath` | CSV file name, relative to the current folder. Default `.\MsFirstPartySPs.csv` |
+
+The CSV contains your tenant's service principal object IDs. Keep it out of source control (this repository's `.gitignore` already excludes `*.csv`).
+
+#### Manual upload (CSV only)
+
+Run without `-WorkspaceResourceId` — or let the script fall back to this if the upload fails — then in **Microsoft Sentinel → Configuration → Watchlist → New**:
+
+| Field | Value |
+|---|---|
+| Name and Alias | `MsFirstPartySPs` (the alias must match exactly) |
+| Source type | Local file |
+| File type | CSV with a header |
+| Number of lines before row with headings | `0` |
+| Upload file | `MsFirstPartySPs.csv` |
+| SearchKey | `ServicePrincipalId` |
+
+#### Watchlist columns
 
 | CSV column | Used for |
 |---|---|
@@ -94,14 +148,21 @@ The script lists every service principal in the tenant whose `AppOwnerOrganizati
 | `DisplayName` | Human review only |
 | `AppOwnerOrganizationId` | Human review only |
 
-After a few minutes, open the workbook and check the status line at the top. It should report the watchlist as loaded with a service-principal count.
+#### 4. Verify
 
-Things to know about the script:
+Watchlist items take a few minutes to appear. Then run this in **Logs**:
 
-- **It replaces the watchlist.** An existing `MsFirstPartySPs` watchlist is deleted before the new one is uploaded. If the upload fails, you are left with no watchlist and the workbook shows all apps until you re-run it or upload the CSV by hand.
-- **`-MicrosoftOwnerTenants` replaces the defaults, it does not add to them.** Include both default tenant IDs (`f8cdef31-a31e-4b4a-93e4-5f571e91255a`, `72f988bf-86f1-41af-91ab-2d7cd011db47`) alongside any tenant you add.
-- **Re-run it periodically.** New Microsoft apps appear in tenants over time and will show in the workbook until the watchlist is refreshed.
-- **Review the CSV before uploading.** See [Microsoft app filter](#microsoft-app-filter) for which apps you may want to remove from it.
+```kql
+_GetWatchlist('MsFirstPartySPs') | count
+```
+
+The count should match the number the script reported. In the workbook, set **Microsoft app filter** to **Watchlist** — first-party apps such as Office 365 Portal and Teams Services should drop out of *App activity* and *Admin actions*. KQL section 0a shows `AlreadyExcluded = true` for covered actors.
+
+#### Maintenance
+
+- **The script replaces the watchlist.** If the upload fails after the old watchlist is deleted, the workbook shows all apps until you re-run the script or upload the CSV by hand.
+- **Re-run it periodically.** New Microsoft apps appear in tenants over time and show in the workbook until the watchlist is refreshed.
+- **Review the CSV before uploading.** See [Microsoft app filter](#microsoft-app-filter) for apps you may want to remove from it.
 
 ---
 
@@ -213,7 +274,7 @@ The **Microsoft app filter** dropdown controls what is hidden from App activity 
 | **Watchlist + built-in AppIds** | The above, plus six global AppIds: Office 365 Portal, Teams Services, Azure MFA, Identity Protection, Device Registration Service, Managed Service Identity |
 | **Off (show all apps)** | Nothing |
 
-The status line at the top of the workbook reports which of these is in effect and how many service principals the watchlist loaded. A missing watchlist never breaks the queries; it only means nothing is hidden.
+The queries read the watchlist straight from the `Watchlist` table, so a missing or empty watchlist never breaks them; it only means nothing is hidden. To confirm the watchlist is loaded, see [Verify](#4-verify).
 
 **The filter hides delegated user activity through Microsoft clients, not just background noise.** The watchlist covers *every* Microsoft-owned app in the tenant, and the Graph panels match on `AppId`. That includes public clients attackers routinely use in device-code phishing — Microsoft Graph Command Line Tools, Azure CLI, Azure PowerShell, Microsoft Office, Microsoft Authentication Broker. With the filter on, a phished admin token used through Azure CLI to assign a role will not appear in *Graph admin writes*. Two ways to handle this:
 
@@ -224,7 +285,12 @@ The status line at the top of the workbook reports which of these is in effect a
 
 1. Run KQL section 0a and note the `AppId` of rows where `AlreadyExcluded` is false.
 2. Look up the owning tenant: `Get-MgServicePrincipal -Filter "appId eq '<AppId>'" -Property DisplayName, AppOwnerOrganizationId`.
-3. If it is genuinely Microsoft, re-run the script with that tenant added: `-MicrosoftOwnerTenants 'f8cdef31-a31e-4b4a-93e4-5f571e91255a','72f988bf-86f1-41af-91ab-2d7cd011db47','<new-tenant-id>'`.
+3. If it is genuinely Microsoft, re-run the script with that tenant added:
+
+   ```powershell
+   .\Export-MsFirstPartySPs.ps1 -TenantId <your-tenant-id-or-domain> -WorkspaceResourceId "<Log Analytics workspace resource ID>" `
+       -MicrosoftOwnerTenants 'f8cdef31-a31e-4b4a-93e4-5f571e91255a','72f988bf-86f1-41af-91ab-2d7cd011db47','<new-owner-tenant-id>'
+   ```
 
 The filter is a noise reduction, not a trust decision. An attacker who adds credentials to a Microsoft-owned service principal, or abuses a managed identity, disappears from the filtered panels.
 

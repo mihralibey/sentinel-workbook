@@ -39,11 +39,19 @@ let BuiltInMsApps = dynamic([                 // global AppIds, identical in eve
 ]);
 // Tenant-specific Microsoft service principals come from the Sentinel watchlist
 // 'MsFirstPartySPs' (columns: ServicePrincipalId, AppId, DisplayName, AppOwnerOrganizationId),
-// built by Export-MsFirstPartySPs.ps1. Missing or empty watchlist => nothing is excluded.
+// built by Export-MsFirstPartySPs.ps1. Read from the Watchlist table directly (fixed schema).
+// Missing or empty watchlist => nothing is excluded.
 let MsWatchlist = union isfuzzy=true
-    (_GetWatchlist('MsFirstPartySPs')
-        | project WlSPId  = tostring(column_ifexists("ServicePrincipalId", "")),
-                  WlAppId = tostring(column_ifexists("AppId", ""))),
+    (Watchlist
+        | where WatchlistAlias =~ "MsFirstPartySPs"
+        | where tostring(column_ifexists("_DTItemType", "watchlist-item")) == "watchlist-item"
+        | extend ItemKey = coalesce(tostring(column_ifexists("_DTItemId", "")), tostring(column_ifexists("WatchlistItemId", "")), tostring(SearchKey)),
+                 ItemTs  = todatetime(column_ifexists("_DTTimestamp", TimeGenerated)),
+                 ItemSt  = tostring(column_ifexists("_DTItemStatus", ""))
+        | summarize arg_max(ItemTs, ItemSt, SearchKey, WatchlistItem) by ItemKey
+        | where ItemSt != "ItemDeleted"
+        | project WlSPId  = tostring(coalesce(tostring(WatchlistItem.ServicePrincipalId), tostring(SearchKey))),
+                  WlAppId = tostring(WatchlistItem.AppId)),
     (datatable(WlSPId:string, WlAppId:string)[]);
 let WlAppIds = toscalar(MsWatchlist | where isnotempty(WlAppId) | summarize make_set(WlAppId));
 let WlSPIds  = toscalar(MsWatchlist | where isnotempty(WlSPId)  | summarize make_set(WlSPId));
