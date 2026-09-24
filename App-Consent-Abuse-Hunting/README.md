@@ -1,96 +1,92 @@
-# App Consent Abuse Hunting — Microsoft Sentinel Workbook
+# App Consent Abuse Hunting
 
-A Microsoft Sentinel / Azure Monitor workbook for hunting **OAuth application consent abuse** in Microsoft Entra ID.
+A Microsoft Sentinel workbook for finding out what OAuth apps in your Entra ID tenant actually did with the permissions they were given.
 
-The central question it answers: *what did applications actually do — on behalf of users (delegated) or as themselves (app-only) — using the consents they already hold?*
+Most consent-abuse hunting stops at "who consented to what". That tells you how the attacker got in, but not what they did afterwards. This workbook starts at the consent and follows the app into the mail it sent, the directory changes it made, and, if you have `MicrosoftGraphActivityLogs`, the specific token behind each call.
 
-Most consent-abuse tooling stops at "who consented to what." That is the root cause, but not the damage. This workbook carries the investigation forward from the consent grant to the mail the app sent, the directory objects it changed, and — where `MicrosoftGraphActivityLogs` is enabled — the individual token that did it.
+![Workbook overview](images/overview.png)
 
 | | |
 |---|---|
-| **Platform** | Microsoft Sentinel / Log Analytics (also loads in Azure Monitor workbooks) |
-| **Author** | Uğur Güdekli |
-| **Files** | `App-Consent-Abuse-Hunting.workbook.json`, `Export-MsFirstPartySPs.ps1` |
-
----
+| Platform | Microsoft Sentinel (also opens in Azure Monitor workbooks) |
+| Author | Uğur Güdekli |
+| Files | `App-Consent-Abuse-Hunting.workbook.json`, `Export-MsFirstPartySPs.ps1` (optional) |
 
 ## Contents
 
-- [Threat model](#threat-model)
-- [Data requirements](#data-requirements)
-- [Deployment](#deployment)
-- [Workbook walkthrough](#workbook-walkthrough)
-- [Tuning and known limitations](#tuning-and-known-limitations)
-- [MITRE ATT&CK coverage](#mitre-attck-coverage)
+- [Why this exists](#why-this-exists)
+- [What you need](#what-you-need)
+- [Install](#install)
+- [Microsoft app watchlist (optional)](#microsoft-app-watchlist-optional)
+- [Using the workbook](#using-the-workbook)
+- [Known limitations](#known-limitations)
+- [MITRE ATT&CK](#mitre-attck)
 
----
+## Why this exists
 
-## Threat model
+Consent abuse usually goes in three steps:
 
-The workbook is built around the illicit-consent-grant kill chain:
+1. **Grant.** Someone consents to an app they shouldn't have. Either a user gets phished into it, or an attacker who already has a privileged role grants admin consent. These days it often comes through device-code or QR-code phishing, where the victim signs in on behalf of a device the attacker controls.
+2. **Persist.** The app now has a refresh token or an application permission. Resetting the user's password doesn't remove it. With application permissions, the app doesn't need the user at all.
+3. **Act.** The app reads and sends mail, pulls files, adds its own credentials or assigns roles. To Entra, all of it looks like normal authenticated API traffic.
 
-1. **Grant.** A user is phished into consenting to a malicious multi-tenant app, or an attacker who already holds a privileged role grants admin consent. Increasingly the grant arrives via **device-code** or **QR-code** phishing, where the victim authenticates a device the attacker controls.
-2. **Persist.** The app now holds a refresh token or an application permission. This survives password resets and, for app-only permissions, survives the user entirely.
-3. **Act.** The app reads and sends mail, exfiltrates files, adds its own credentials, or assigns directory roles — all as legitimate, fully-authenticated API traffic.
+Sign-in logs show you step 1 and part of step 2. Step 3 is where the damage happens, and you only see it in `MicrosoftGraphActivityLogs`. Most of this workbook is built on that table.
 
-Step 3 is the part that is usually invisible. Sign-in logs show the app authenticated; they do not show what it then did. `MicrosoftGraphActivityLogs` closes that gap, and this workbook is largely an interface onto that table.
+Two things to keep in mind when reading any panel:
 
-Two distinctions drive every query:
+- **Delegated or app-only.** In `MicrosoftGraphActivityLogs`, an empty `UserId` means the app called Graph as itself, using application permissions (`Roles`). A filled `UserId` means it acted on behalf of that user, using delegated scopes (`Scopes`). Cleaning up after each one is very different.
+- **Granted or used.** An app that holds `Mail.ReadWrite` and never uses it is a hygiene issue. The same app sending POST requests with that permission is an incident.
 
-- **Delegated vs app-only.** In `MicrosoftGraphActivityLogs`, an empty `UserId` means the call was app-only — the app acting under its own application permissions (`Roles`). A populated `UserId` means delegated — the app acting on behalf of that user under consented scopes (`Scopes`). These have very different blast radii and very different remediation.
-- **Grant vs use.** A high-risk permission that was granted but never exercised is a hygiene problem. The same permission showing write traffic is an incident.
+## What you need
 
----
+Send these to your Sentinel workspace from **Entra ID > Monitoring > Diagnostic settings**:
 
-## Data requirements
-
-Enable these in **Entra ID → Diagnostic settings**, exporting to the Sentinel workspace:
-
-| Table | Feeds | Required |
+| Table | Used by | Needed? |
 |---|---|---|
-| `AuditLogs` | Consents, grants, app-initiated directory changes | **Yes** |
-| `MicrosoftGraphActivityLogs` | All app-activity, mail, admin-write and token-chain views | **Yes** for tabs 2–5 |
-| `SigninLogs` | App name lookup, device-code sign-ins | Recommended |
-| `AADNonInteractiveUserSignInLogs` | App name lookup, device-code sign-ins, token chain | Recommended |
-| `AADServicePrincipalSignInLogs` | App name lookup, app-only sign-in baseline | Recommended |
-| `OfficeActivity` | Exchange sends outside Graph (EWS, REST, SMTP OAuth) | Optional — needs the Office 365 connector |
-| Watchlist `MsFirstPartySPs` | Microsoft app filter on tabs 2 and 4 | Optional — see [Microsoft app watchlist](#optional-microsoft-app-watchlist) |
+| `AuditLogs` | Consents, grants, changes made by apps | Yes |
+| `MicrosoftGraphActivityLogs` | App activity, mail, admin writes, device-code chain | Yes, for tabs 2 to 5 |
+| `SigninLogs` | App names, device-code sign-ins | Recommended |
+| `AADNonInteractiveUserSignInLogs` | App names, device-code sign-ins, token chain | Recommended |
+| `AADServicePrincipalSignInLogs` | App names | Recommended |
+| `OfficeActivity` | Exchange sends that don't go through Graph (EWS, REST, SMTP OAuth) | Optional, needs the Microsoft 365 connector |
+| `MsFirstPartySPs` watchlist | Hiding Microsoft's own apps on tabs 2 and 4 | Optional, see [below](#microsoft-app-watchlist-optional) |
 
-`MicrosoftGraphActivityLogs` is the one to check first. It is not on by default, it is billed as analytics data, and it is high volume in most tenants. Without it, tabs 2 through 5 return nothing and the workbook reduces to a consent-grant report.
+Check `MicrosoftGraphActivityLogs` first. It's off by default, it's billed as analytics data, and it's noisy in most tenants. Without it, tabs 2 to 5 stay empty and you're left with a consent report.
 
-Missing tables are tolerated rather than fatal: the queries use `union isfuzzy=true` and `column_ifexists()` throughout, so a workbook in a partially-onboarded tenant renders with empty panels instead of errors.
+If a table is missing, the panels that use it come up empty rather than erroring. The queries use `union isfuzzy=true` and `column_ifexists()` for that.
 
----
+## Install
 
-## Deployment
+1. In Microsoft Sentinel, open **Workbooks** and click **Add workbook**.
+2. Click **Edit**, then the **Advanced editor** (`</>`) button.
+3. Paste the contents of `App-Consent-Abuse-Hunting.workbook.json`, click **Apply**, then **Save**.
 
-**Portal (quickest):**
+If you deploy with ARM or Bicep, put the JSON in a `Microsoft.Insights/workbooks` resource with `serializedData` set to the file contents as a string and `category` set to `sentinel`.
 
-1. Microsoft Sentinel → your workspace → **Workbooks** → **Add workbook**.
-2. Open the **Advanced editor** (`</>` icon).
-3. Replace the contents with `App-Consent-Abuse-Hunting.workbook.json`, click **Apply**, then **Save**.
+That's enough to start. The watchlist in the next section is only there to cut noise.
 
-**As an ARM template:** wrap the JSON in a `Microsoft.Insights/workbooks` resource with `serializedData` set to the stringified file, and `category` set to `sentinel`.
+## Microsoft app watchlist (optional)
 
-Then set the **Time range** and, optionally, paste an AppId into **App filter** — see the [limitations](#tuning-and-known-limitations) note on which tabs honour that filter.
+Microsoft's own service principals (Office 365 Portal, Teams Services, Azure MFA, Identity Protection and a few hundred more) show up a lot on the App activity and Admin actions tabs. Service principal object IDs are different in every tenant, so there's no fixed list I can ship. `Export-MsFirstPartySPs.ps1` builds one for your tenant and uploads it as a Sentinel watchlist called `MsFirstPartySPs`.
 
-### Optional: Microsoft app watchlist
+You don't have to do this. Without the watchlist, the workbook hides nothing and shows every app.
 
-The workbook works without any setup. Without the watchlist, nothing is hidden and Microsoft first-party apps show alongside everything else. To cut that noise, build the `MsFirstPartySPs` watchlist once per tenant with `Export-MsFirstPartySPs.ps1`.
+### Before you run it
 
-#### 1. Prerequisites
+You need:
 
-| Need | Details |
-|---|---|
-| PowerShell | Windows PowerShell 5.1 or PowerShell 7 |
-| One sign-in tool | The script uses the first one it finds: **Az.Accounts** (`Install-Module Az.Accounts -Scope CurrentUser`, recommended), **Azure CLI** (`winget install Microsoft.AzureCLI`), or **Microsoft.Graph.Authentication** (`Install-Module Microsoft.Graph.Authentication -Scope CurrentUser`, CSV only — cannot upload) |
-| Directory read | An account in the target tenant that can read service principals. Default member users can; if user directory access is restricted, use **Directory Readers** |
-| Upload rights | **Microsoft Sentinel Contributor** on the workspace (only when using `-WorkspaceResourceId`) |
+- Windows PowerShell 5.1 or PowerShell 7.
+- One of these sign-in tools. The script uses the first one it finds:
+  - `Install-Module Az.Accounts -Scope CurrentUser` (recommended)
+  - `winget install Microsoft.AzureCLI`
+  - `Install-Module Microsoft.Graph.Authentication -Scope CurrentUser` (can write the CSV but can't upload it)
+- An account in the tenant that can read service principals. Normal members can, unless you've restricted user access to the directory. In that case use Directory Readers.
+- Microsoft Sentinel Contributor on the workspace, if you want the script to upload the watchlist for you.
 
-#### 2. Collect the two IDs
+And two values:
 
-- **Tenant ID** — the GUID from **Entra ID → Overview**, or a verified domain such as `contoso.onmicrosoft.com`.
-- **Workspace resource ID** — **Log Analytics workspace → Overview → JSON View → Resource ID**, or:
+- **Tenant ID.** The GUID on the Entra ID overview page, or a domain like `contoso.onmicrosoft.com`.
+- **Workspace resource ID.** On the Log Analytics workspace, go to **Overview > JSON View** and copy **Resource ID**. Or:
 
   ```powershell
   (Get-AzOperationalInsightsWorkspace -ResourceGroupName <rg> -Name <ws>).ResourceId
@@ -100,188 +96,184 @@ The workbook works without any setup. Without the watchlist, nothing is hidden a
 
   It looks like `/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.OperationalInsights/workspaces/<ws>`.
 
-#### 3. Run the script
+### Run it
 
 ```powershell
 .\Export-MsFirstPartySPs.ps1 -TenantId <your-tenant-id-or-domain> -WorkspaceResourceId "<Log Analytics workspace resource ID>"
 ```
 
-The script:
+What it does:
 
-1. Signs in to the tenant given in `-TenantId` only. It turns off Windows account broker (WAM) sign-in for the process, ignores cached Az contexts and Azure CLI accounts (the CLI runs in a throwaway profile), and checks the `tid` claim of every token. If a token belongs to any other tenant, the script stops before reading or writing anything.
-2. Reads all service principals from Microsoft Graph and keeps those whose `appOwnerOrganizationId` is a Microsoft tenant.
-3. Writes `MsFirstPartySPs.csv` to the current folder.
-4. Deletes any existing `MsFirstPartySPs` watchlist on the workspace and uploads the new one.
-5. Signs out and removes the temporary session.
+1. Signs in to the tenant you passed in `-TenantId`, and only that tenant. It turns off Windows single sign-on (WAM) for its own process, ignores any Az or Azure CLI sessions already on the machine, and checks the tenant ID inside every token it gets. If a token is for a different tenant, it stops before reading or writing anything.
+2. Reads every service principal from Microsoft Graph and keeps the ones whose `appOwnerOrganizationId` is a Microsoft tenant.
+3. Writes them to `MsFirstPartySPs.csv` in the current folder.
+4. Deletes the existing `MsFirstPartySPs` watchlist, if there is one, and uploads the new list.
+5. Signs out and cleans up its temporary session.
 
-Optional parameters:
+Leave out `-WorkspaceResourceId` if you only want the CSV.
 
-| Parameter | Use |
+Other parameters:
+
+| Parameter | What it's for |
 |---|---|
-| `-UseDeviceCode` | Sign in with a device code instead of a browser window — useful when the browser keeps choosing the wrong account. Conditional Access may block device-code flow |
-| `-MicrosoftOwnerTenants` | Owner tenant IDs treated as Microsoft. **Replaces** the defaults, so always include `f8cdef31-a31e-4b4a-93e4-5f571e91255a` and `72f988bf-86f1-41af-91ab-2d7cd011db47` alongside any tenant you add |
-| `-Alias` | Watchlist alias. Leave at `MsFirstPartySPs` — the workbook looks for that name |
-| `-OutputPath` | CSV file name, relative to the current folder. Default `.\MsFirstPartySPs.csv` |
+| `-UseDeviceCode` | Sign in with a code instead of a browser window. Handy when the browser keeps picking the wrong account. Conditional Access may block it. |
+| `-MicrosoftOwnerTenants` | Which owner tenants count as Microsoft. This replaces the default list, so include `f8cdef31-a31e-4b4a-93e4-5f571e91255a` and `72f988bf-86f1-41af-91ab-2d7cd011db47` along with anything you add. |
+| `-Alias` | Watchlist name. Leave it as `MsFirstPartySPs`, since that's what the workbook looks for. |
+| `-OutputPath` | CSV file name, relative to the current folder. Defaults to `.\MsFirstPartySPs.csv`. |
 
-The CSV contains your tenant's service principal object IDs. Keep it out of source control (this repository's `.gitignore` already excludes `*.csv`).
+The CSV lists your tenant's service principal IDs, so don't commit it anywhere public. This repo's `.gitignore` already ignores `*.csv`.
 
-#### Manual upload (CSV only)
+### Uploading the CSV yourself
 
-Run without `-WorkspaceResourceId` — or let the script fall back to this if the upload fails — then in **Microsoft Sentinel → Configuration → Watchlist → New**:
+If you ran the script without `-WorkspaceResourceId`, or the upload failed, go to **Microsoft Sentinel > Configuration > Watchlist > New** and fill in:
 
 | Field | Value |
 |---|---|
-| Name and Alias | `MsFirstPartySPs` (the alias must match exactly) |
+| Name and alias | `MsFirstPartySPs` (has to match exactly) |
 | Source type | Local file |
 | File type | CSV with a header |
-| Number of lines before row with headings | `0` |
-| Upload file | `MsFirstPartySPs.csv` |
-| SearchKey | `ServicePrincipalId` |
+| Lines before the header row | `0` |
+| File | `MsFirstPartySPs.csv` |
+| Search key | `ServicePrincipalId` |
 
-#### Watchlist columns
+The CSV has four columns. The workbook uses `ServicePrincipalId` (for `AuditLogs` rows that have no `appId`) and `AppId` (for everything else). `DisplayName` and `AppOwnerOrganizationId` are there so you can read the list.
 
-| CSV column | Used for |
-|---|---|
-| `ServicePrincipalId` | Tenant-specific object ID. Matches `AuditLogs` actors that have no `appId` |
-| `AppId` | Global application ID. Matches `MicrosoftGraphActivityLogs` and `AuditLogs` |
-| `DisplayName` | Human review only |
-| `AppOwnerOrganizationId` | Human review only |
+### Check it worked
 
-#### 4. Verify
-
-Watchlist items take a few minutes to appear. Then run this in **Logs**:
+Give it a few minutes, then run this in **Logs**:
 
 ```kql
 _GetWatchlist('MsFirstPartySPs') | count
 ```
 
-The count should match the number the script reported. In the workbook, set **Microsoft app filter** to **Watchlist** — first-party apps such as Office 365 Portal and Teams Services should drop out of *App activity* and *Admin actions*. The [coverage check](#watchlist-coverage-check) query shows `InWatchlist = true` for covered actors.
+The number should match what the script printed. The **Microsoft app filter** dropdown in the workbook also shows the count, for example `Watchlist (890) + 6 built-in AppIds`. If it says the watchlist wasn't found or is empty, the workbook is showing every app.
 
-#### Maintenance
+### Keeping it current
 
-- **The script replaces the watchlist.** If the upload fails after the old watchlist is deleted, the workbook shows all apps until you re-run the script or upload the CSV by hand.
-- **Re-run it periodically.** New Microsoft apps appear in tenants over time and show in the workbook until the watchlist is refreshed.
-- **Review the CSV before uploading.** See [Microsoft app filter](#microsoft-app-filter) for apps you may want to remove from it.
+- Microsoft adds new apps to tenants over time. Run the script again every so often, or new ones will show up in the workbook.
+- The script deletes the old watchlist before it uploads the new one. If the upload fails in between, you'll have no watchlist and the workbook shows everything until you run it again or upload the CSV by hand.
+- Have a look through the CSV before you upload it. The next section explains which apps you might want to take out.
 
----
+## Using the workbook
 
-## Workbook walkthrough
+Start at **Overview**, pick a time range, and work left to right through the tabs. To focus on a single app, paste its AppId into **App filter**.
 
 ### Overview
 
-Five headline counts over the selected range — consents and grants, mail sent by apps via Graph, admin writes via Graph, Entra changes initiated by apps, and successful device-code sign-ins — followed by a timechart splitting Graph **write** calls into delegated and app-only.
+Five counts for the selected range: consents and grants, mail sent by apps through Graph, admin writes through Graph, Entra changes made by apps, and successful device-code sign-ins. Below them is a chart of Graph write calls, split into delegated and app-only.
 
-The tiles are a triage surface, not a detection. Read the timechart for shape rather than volume:
+![Graph write calls, delegated vs app-only](images/graph-writes-trend.png)
 
-- A spike in **delegated writes** from an app nobody recognises, landing shortly after a phishing wave, is the device-code / QR-code pattern.
-- A spike in **app-only writes** points at an application permission — `Mail.Send`, `RoleManagement.ReadWrite.Directory` — or at a stolen client secret.
+The counts are a starting point, not alerts. On the chart, look for changes in shape rather than big numbers. App-only writes usually have a steady background level, like the blue line above. A sudden jump in delegated writes from an app nobody recognises, especially after a phishing wave, is what device-code and QR-code phishing looks like. A jump in app-only writes means something is using application permissions like `Mail.Send` or `RoleManagement.ReadWrite.Directory`, or someone has a stolen client secret.
+
+In the example above, the delegated line spikes on 21 September. The Consents tab shows why.
 
 ### 1. Consents
 
-The root cause. Pulls `AuditLogs` for `Consent to application`, `Add delegated permission grant`, and `Add app role assignment to service principal`.
+This tab shows three kinds of `AuditLogs` event: `Consent to application`, `Add delegated permission grant` and `Add app role assignment to service principal`.
 
-The interesting work is in the `mv-apply`: `TargetResources[0].modifiedProperties` is flattened into a property bag so the granted permission string can be lifted out of whichever field carries it — `ConsentAction.Permissions` for interactive consent, `DelegatedPermissionGrant.Scope` for a direct grant, `AppRole.Value` for an app-role assignment. Those three shapes are why a naive query misses grants.
+![Consents tab](images/consents.png)
 
-Output surfaces the actor and actor IP, the target app, whether it was **admin** consent (`ConsentContext.IsAdminConsent`), and a `HighRisk` flag set when the permission string matches the shared high-risk list. Rows sort high-risk first.
+The permission that was granted is stored in a different field depending on how it happened: `ConsentAction.Permissions` for interactive consent, `DelegatedPermissionGrant.Scope` for a direct grant, `AppRole.Value` for an app role assignment. The query flattens `modifiedProperties` and checks all three, because a query that only checks one will miss grants.
 
-Triage order: admin consent on a high-risk permission, then user consent on a high-risk permission, then anything granted from an unfamiliar IP.
+Each row shows who did it and from which IP, the target app, whether it was admin consent, and a `HighRisk` flag if the permissions include anything from the high-risk list (mail, files, directory writes, role management, Conditional Access and so on). High-risk rows come first.
+
+In the screenshot, an admin consented to Microsoft Graph Command Line Tools with `Application.ReadWrite.All` a few minutes before the delegated write spike. That's the kind of link you're looking for.
+
+Work through it in this order: admin consent to high-risk permissions, then user consent to high-risk permissions, then anything from an IP you don't recognise.
 
 ### 2. App activity
 
-One row per app per access type, from `MicrosoftGraphActivityLogs`. Aggregates call volume, write count, failure count, distinct users, distinct source IPs, and — importantly — `PermissionsUsed`, the set of `Scopes` or `Roles` **actually presented** on those calls.
+One row per app and access type, built from `MicrosoftGraphActivityLogs`. You get call count, write count, failures, distinct users, distinct source IPs, and `PermissionsUsed`, which is the `Scopes` or `Roles` the app actually sent with its calls.
 
-That last column is what makes this tab worth more than an app inventory. Entra tells you what an app *may* do; this tells you what it *did*. An app holding `Mail.ReadWrite` that has never presented it is a cleanup ticket. The same app presenting it on POST traffic is an investigation.
+`PermissionsUsed` is the important column. Entra tells you what an app is allowed to do; this column tells you what it did. An app that holds `Mail.ReadWrite` and never uses it needs cleaning up. An app using it on POST requests needs investigating.
 
-`FailedCalls` is a useful secondary signal: a high 4xx rate alongside broad URI coverage reads as enumeration — an attacker probing what a stolen token can reach.
+Keep an eye on `FailedCalls`. Lots of 4xx errors across a wide range of URIs usually means someone is testing what a stolen token can reach.
 
 ### 3. Mail sent by apps
 
-Two panels, deliberately overlapping, because neither source is complete alone.
+There are two panels here because neither source catches everything.
 
-**Graph sends** matches `POST` against `sendMail`, `send`, `reply`, `replyAll` and `forward`, extracting the target mailbox from `/users/{id}/` in the request URI. The `AccessType` split matters here: app-only mail sends are rarely legitimate outside a known service account, and should be treated as high-signal.
+**Graph sends** looks for POST requests to `sendMail`, `send`, `reply`, `replyAll` and `forward`, and pulls the target mailbox out of the URI. App-only mail sends are rare outside known service accounts, so take them seriously.
 
-**Exchange sends** covers `Send`, `SendAs` and `SendOnBehalf` in `OfficeActivity`, catching EWS, Outlook REST and SMTP-OAuth traffic that never touches Graph. Five first-party client IDs (OWA, Microsoft Office, Outlook Mobile, One Outlook, Teams) are allowlisted out. Results are aggregated by calling app with a distinct-mailbox count, so one app touching many mailboxes rises to the top — the worm shape.
+**Exchange sends** looks at `Send`, `SendAs` and `SendOnBehalf` in `OfficeActivity`. This catches EWS, Outlook REST and SMTP OAuth, which never touch Graph. Five normal Microsoft clients (OWA, Microsoft Office, Outlook Mobile, One Outlook, Teams) are filtered out. Results are grouped by app with a count of mailboxes, so an app sending from lots of mailboxes (a worm) ends up at the top.
 
-**The allowlist is the weak point, and it is a deliberate tradeoff.** Device-code phishing typically reuses *first-party* client IDs, which means a real attack can be sitting in the rows this panel just filtered away. Always corroborate with tab 5 rather than reading this panel as exhaustive.
+That filter is a trade-off. Device-code phishing usually borrows a Microsoft client ID, so the attack you're looking for may be one of the rows this panel hides. Check tab 5 as well; don't rely on this panel alone.
 
 ### 4. Admin actions by apps
 
-**Entra audit** returns `AuditLogs` entries where `InitiatedBy.app` is populated — changes made by a service principal with no user in the loop. A `Sensitive` flag marks role assignments, credential additions, application and service-principal ownership changes, password resets, domain federation changes, and Conditional Access edits.
+**Entra audit** shows `AuditLogs` entries where `InitiatedBy.app` is set, meaning a service principal made the change without a user involved. `Sensitive` marks role assignments, new credentials, owner changes on apps and service principals, password resets, domain federation changes and Conditional Access edits.
 
-Two of those deserve specific attention. `Add service principal credentials` is how an attacker converts a delegated foothold into durable app-only access — they add their own secret or certificate to an existing trusted app. `Set federation settings on domain` is the federated-trust backdoor; it is rare enough in most tenants that any hit warrants a look.
+Watch two of those closely. `Add service principal credentials` is how an attacker turns a delegated foothold into long-term app-only access: they add their own secret or certificate to an app you already trust. `Set federation settings on domain` is a federation backdoor, and it's rare enough that any hit is worth a look.
 
-**Graph admin writes** catches the same intent one layer down, including delegated calls the audit log attributes to the user rather than the app. The URI regex covers `roleManagement`, `directoryRoles`, `oauth2PermissionGrants`, `appRoleAssignments`, `addPassword`, `addKey`, `federatedIdentityCredentials`, `identity/conditionalAccess`, `policies`, `domains`, `authentication/methods` and `owners`.
+**Graph admin writes** finds the same kind of activity in Graph traffic. This includes delegated calls, which the audit log attributes to the user instead of the app. It matches `roleManagement`, `directoryRoles`, `oauth2PermissionGrants`, `appRoleAssignments`, `addPassword`, `addKey`, `federatedIdentityCredentials`, `identity/conditionalAccess`, `policies`, `domains`, `authentication/methods` and `owners` in the request URI.
 
-Run both. The audit panel tells you what changed; the Graph panel tells you which token changed it.
+Use both panels. The audit log tells you what changed, and Graph tells you which token did it.
 
 ### 5. Device-code chain
 
-The tab the rest of the workbook builds toward, and the one that turns a suspicion into a timeline.
+This tab connects a phishing sign-in to what the attacker did with it.
 
-The first panel simply lists device-code sign-ins. The second correlates them end to end:
+The first panel lists device-code sign-ins. The second follows each one through:
 
-1. Union `SigninLogs` and `AADNonInteractiveUserSignInLogs`, deriving a `SessionKey` from `SessionId` — falling back to `UniqueTokenIdentifier` where `SessionId` is not populated.
-2. Select successful device-code sessions (`AuthenticationProtocol =~ "deviceCode"`, or `OriginalTransferMethod =~ "deviceCodeFlow"`).
-3. Collect **every** token issued in those sessions — this is the step that follows refresh-token descendants, so activity from tokens minted hours after the original phish still attributes back.
-4. Join `MicrosoftGraphActivityLogs` on `SignInActivityId == UniqueTokenIdentifier` and summarise what each session did.
+1. It combines `SigninLogs` and `AADNonInteractiveUserSignInLogs` and groups them by `SessionId`. If `SessionId` is empty, it uses `UniqueTokenIdentifier` instead.
+2. It keeps sessions with a successful device-code sign-in (`AuthenticationProtocol` is `deviceCode`, or `OriginalTransferMethod` is `deviceCodeFlow`).
+3. It collects every token issued in those sessions. This is how refresh tokens issued hours after the phish still get tied back to it.
+4. It joins those tokens to `MicrosoftGraphActivityLogs` on `SignInActivityId` and summarises what each session did.
 
-The result is one row per compromised session: the phish time and IP, the app used, the Graph IPs that followed, a set of the distinct actions taken, and a `MailSends` count.
+You get one row per session: when and from where the phish happened, which app was used, the IPs that called Graph afterwards, what they did, and a `MailSends` count.
 
-**Rows with `MailSends > 0` are the strongest single indicator in this workbook** — a successful device-code authentication whose token then sent mail is the self-propagating QR-code phish, and it is very hard to explain benignly.
+If `MailSends` is above zero, look at it first. A device-code sign-in followed by that token sending mail is the self-spreading QR-code phish, and it's very hard to explain any other way.
 
-A caveat on step 3: the fallback to `UniqueTokenIdentifier` when `SessionId` is empty narrows the chain to the device-code token itself, so refresh-token descendants are lost for those sessions. Sessions with a populated `SessionId` give the full picture; treat a thin result as possibly incomplete rather than as an all-clear.
+When `SessionId` is empty and the query falls back to `UniqueTokenIdentifier`, it only sees the original device-code token. Refresh tokens from that session are missed. A short or empty result may just mean the data is incomplete, so don't read it as all clear.
 
----
+## Known limitations
 
-## Tuning and known limitations
+**App filter doesn't reach every panel.** The header says it applies to every tab, but the Overview counts, the Consents tab, the device-code list and the token chain ignore it. Treat those as tenant-wide, or add `| where AppId == AppFilter` to them.
 
-Read this section before treating any panel as authoritative.
+**High-risk permission matching.** `has_any` splits on dots, so `Mail.Read` doesn't match `Mail.ReadWrite`. Both are listed for that reason. Add any new permission by its full name. New Graph permissions won't be flagged until someone adds them.
 
-**The App filter does not apply to every tab.** The workbook header says it pivots every tab; in the current version it is honoured by the overview timechart, app activity, both mail panels, and both admin panels — but **not** by the overview tiles, the Consents tab, the device-code list, or the token-to-action chain. Those four render unfiltered. Either read them as tenant-wide, or add `| where AppId == AppFilter` before relying on the filter there.
+**The Exchange client filter can hide attacks.** See tab 3. It's there to cut noise, not because those clients are safe.
 
-**`HighRiskPerms` matching is term-based.** `has_any` tokenises on `.`, so `Mail.Read` does not match `Mail.ReadWrite` — both are listed explicitly for that reason. Any permission you add to the list should be added in full, and newly-introduced Graph permissions will not be flagged until the list is updated.
+**App names only go back 30 days.** Names come from sign-in logs over the last 30 days, whatever time range you pick. An app that hasn't signed in for longer shows up with an AppId and no name.
 
-**The Exchange allowlist hides real attacks.** See tab 3. It is tuned to cut noise, not to be safe. Widen it only with evidence, and never read that panel in isolation.
+**Cost.** `MicrosoftGraphActivityLogs` is big. On a large tenant, pick a short time range before you open the workbook. The token chain is the most expensive query, with a union and two joins.
 
-**App names use a fixed 30-day window.** The `AppNames` lookup is pinned to `ago(30d)`, independent of the selected time range — an app that last signed in more than 30 days ago will show its AppId with a blank name rather than being dropped.
+**Tune before alerting.** Everything here is set up for interactive hunting. Get a baseline for your own tenant before you turn any of it into an analytics rule.
 
-**Cost.** `MicrosoftGraphActivityLogs` is high-volume. Narrow the time range before opening the workbook on a large tenant, and expect the token-chain query to be the most expensive panel — it unions the sign-in tables and performs two joins.
+### How the Microsoft app filter works
 
-**Tune before alerting.** Every threshold and allowlist here is written for interactive hunting. Baseline your own tenant's normal app behaviour before promoting any of these to an analytics rule.
+The **Microsoft app filter** dropdown only affects App activity (tab 2) and the two Admin actions panels (tab 4). Overview, Consents, Mail and the Device-code chain are never filtered.
 
-### Microsoft app filter
-
-The **Microsoft app filter** dropdown controls what is hidden from App activity (tab 2) and both Admin actions panels (tab 4). Overview, Consents, Mail and Device-code chain are never filtered.
-
-| Option | Hides |
+| Option | What it hides |
 |---|---|
-| **Watchlist (if configured)** — default | AppIds and service principal IDs in `MsFirstPartySPs`. Nothing if the watchlist is missing or empty |
-| **Watchlist + built-in AppIds** | The above, plus six global AppIds: Office 365 Portal, Teams Services, Azure MFA, Identity Protection, Device Registration Service, Managed Service Identity |
-| **Off (show all apps)** | Nothing |
+| Watchlist (default) | Everything in `MsFirstPartySPs`. If the watchlist is missing or empty, nothing is hidden. |
+| Watchlist + 6 built-in AppIds | The watchlist, plus Office 365 Portal, Teams Services, Azure MFA, Identity Protection, Device Registration Service and Managed Service Identity. These AppIds are the same in every tenant. |
+| Off | Nothing |
 
-The queries read the watchlist straight from the `Watchlist` table, so a missing or empty watchlist never breaks them; it only means nothing is hidden. To confirm the watchlist is loaded, see [Verify](#4-verify).
+The dropdown labels show how many entries the watchlist has. A missing watchlist doesn't break any query; nothing gets hidden.
 
-**The filter hides delegated user activity through Microsoft clients, not just background noise.** The watchlist covers *every* Microsoft-owned app in the tenant, and the Graph panels match on `AppId`. That includes public clients attackers routinely use in device-code phishing — Microsoft Graph Command Line Tools, Azure CLI, Azure PowerShell, Microsoft Office, Microsoft Authentication Broker. With the filter on, a phished admin token used through Azure CLI to assign a role will not appear in *Graph admin writes*. Two ways to handle this:
+**This hides more than background noise.** The watchlist includes every app Microsoft owns, and the Graph panels filter by AppId. That includes Microsoft Graph Command Line Tools, Azure CLI, Azure PowerShell, Microsoft Office and Microsoft Authentication Broker, which are exactly the clients attackers use for device-code phishing. With the filter on, a phished admin token that assigns a role through Azure CLI won't show up in Graph admin writes. You can deal with this in two ways:
 
-- Set the filter to **Off** whenever you are investigating a specific user or incident, and use the Device-code chain tab (always unfiltered) as the authoritative view.
-- Or remove public-client apps from `MsFirstPartySPs.csv` before uploading, so only background service principals are hidden.
+- Turn the filter **Off** when you're investigating a specific user or incident, and treat the Device-code chain tab, which is never filtered, as the source of truth.
+- Or take those public client apps out of the CSV before uploading, so the watchlist only hides background services.
 
-**If a Microsoft actor still appears with the filter on,** its app is owned by a tenant the script does not know about:
+Also remember that the filter only hides things; it doesn't mean they're safe. If an attacker adds credentials to a Microsoft-owned service principal or abuses a managed identity, those panels won't show it while the filter is on.
 
-1. Run the [coverage check](#watchlist-coverage-check) below and note the `AppId` of rows where `InWatchlist` is false.
-2. Look up the owning tenant: `Get-MgServicePrincipal -Filter "appId eq '<AppId>'" -Property DisplayName, AppOwnerOrganizationId`.
-3. If it is genuinely Microsoft, re-run the script with that tenant added:
+### A Microsoft app still shows up
+
+Its owner tenant probably isn't one of the two the script knows about.
+
+1. Run the coverage check below and note the `AppId` on rows where `InWatchlist` is false.
+2. Find out who owns it: `Get-MgServicePrincipal -Filter "appId eq '<AppId>'" -Property DisplayName, AppOwnerOrganizationId`.
+3. If it really is Microsoft's, run the script again with that tenant added:
 
    ```powershell
    .\Export-MsFirstPartySPs.ps1 -TenantId <your-tenant-id-or-domain> -WorkspaceResourceId "<Log Analytics workspace resource ID>" `
        -MicrosoftOwnerTenants 'f8cdef31-a31e-4b4a-93e4-5f571e91255a','72f988bf-86f1-41af-91ab-2d7cd011db47','<new-owner-tenant-id>'
    ```
 
-The filter is a noise reduction, not a trust decision. An attacker who adds credentials to a Microsoft-owned service principal, or abuses a managed identity, disappears from the filtered panels.
-
-#### Watchlist coverage check
-
-Run in **Logs** to list every app that initiated changes in `AuditLogs` over 30 days, with its `AppId`, its tenant-specific `ServicePrincipalId`, and whether the watchlist covers it:
+Coverage check. It lists every app that made changes in `AuditLogs` over the last 30 days and whether the watchlist covers it:
 
 ```kql
 let Wl = _GetWatchlist('MsFirstPartySPs')
@@ -298,26 +290,22 @@ AuditLogs
 | order by InWatchlist asc, Events desc
 ```
 
----
+## MITRE ATT&CK
 
-## MITRE ATT&CK coverage
-
-| Technique | Where |
+| Technique | Tab |
 |---|---|
-| **T1528** — Steal Application Access Token | Tabs 1, 5 |
-| **T1550.001** — Use Alternate Authentication Material: Application Access Token | Tabs 2, 5 |
-| **T1098.001** — Account Manipulation: Additional Cloud Credentials | Tab 4 |
-| **T1098.003** — Account Manipulation: Additional Cloud Roles | Tab 4 |
-| **T1114.002** — Email Collection: Remote Email Collection | Tab 3 |
-| **T1566** — Phishing (device-code / QR-code delivery) | Tab 5 |
-| **T1484.002** — Domain Trust Modification | Tab 4 |
-
----
+| T1528 Steal Application Access Token | 1, 5 |
+| T1550.001 Use Alternate Authentication Material: Application Access Token | 2, 5 |
+| T1098.001 Account Manipulation: Additional Cloud Credentials | 4 |
+| T1098.003 Account Manipulation: Additional Cloud Roles | 4 |
+| T1114.002 Email Collection: Remote Email Collection | 3 |
+| T1566 Phishing (device code / QR code) | 5 |
+| T1484.002 Domain or Tenant Policy Modification: Trust Modification | 4 |
 
 ## Contributing
 
-Issues and pull requests are welcome, particularly additions to `HighRiskPerms`, refinements to the Exchange client allowlist, and detections for consent-abuse paths not yet covered.
+Issues and PRs are welcome, especially additions to the high-risk permission list, fixes to the Exchange client filter, and consent-abuse paths the workbook doesn't cover yet.
 
 ## Disclaimer
 
-Provided as-is, with no warranty. These queries are hunting aids, not validated detections — test them in your own tenant and tune the allowlists and thresholds before acting on the results or promoting them to alerts.
+Provided as is, no warranty. These are hunting queries, not tested detections. Try them in your own tenant and tune the filters and thresholds before you act on the results or turn them into alerts.

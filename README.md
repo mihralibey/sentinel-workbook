@@ -1,37 +1,38 @@
-# Microsoft Sentinel Workbooks
+# Sentinel Workbooks
 
-A collection of Microsoft Sentinel / Azure Monitor workbooks for threat hunting and investigation in Microsoft Entra ID and Microsoft 365.
+Microsoft Sentinel workbooks I've built for threat hunting in Entra ID and Microsoft 365. Each one has its own folder with the workbook JSON, a README, and any setup scripts it needs.
 
 ## Workbooks
 
-| Workbook | Focus | Key tables | MITRE ATT&CK |
-|---|---|---|---|
-| [App Consent Abuse Hunting](App-Consent-Abuse-Hunting/) | What OAuth apps did with the consents they hold: delegated vs app-only Graph activity, mail sent by apps, app-initiated admin changes, and device-code phishing token-to-action correlation | `AuditLogs`, `MicrosoftGraphActivityLogs`, `SigninLogs`, `AADNonInteractiveUserSignInLogs`, `AADServicePrincipalSignInLogs`, `OfficeActivity` | T1528, T1550.001, T1098.001, T1098.003, T1114.002, T1566, T1484.002 |
+| Workbook | What it's for | Main tables |
+|---|---|---|
+| [App Consent Abuse Hunting](App-Consent-Abuse-Hunting/) | Follows OAuth apps from the consent they were given to what they did with it: Graph activity (delegated and app-only), mail sent, admin changes, and device-code phishing traced from sign-in to action | `AuditLogs`, `MicrosoftGraphActivityLogs`, sign-in logs, `OfficeActivity` |
 
-## Repository layout
+## Adding a workbook to Sentinel
+
+1. In Microsoft Sentinel, open **Workbooks** and click **Add workbook**.
+2. Click **Edit**, then the **Advanced editor** (`</>`) button.
+3. Paste the contents of the `.workbook.json` file, click **Apply**, then **Save**.
+
+Read the workbook's README before you start. It lists the data connectors and diagnostic settings it depends on. Missing tables don't cause errors; the panels just come up empty.
+
+## Folder layout
 
 ```
 <Workbook-Name>/
-    README.md                     # threat model, data requirements, walkthrough, limitations
-    <Workbook-Name>.workbook.json # import via Sentinel > Workbooks > Advanced editor
-    *.ps1                         # optional setup helpers (e.g. watchlist builders)
+    README.md
+    <Workbook-Name>.workbook.json
+    *.ps1        optional setup scripts
+    images/      screenshots used in the README
 ```
-
-## Importing a workbook
-
-1. Microsoft Sentinel → your workspace → **Workbooks** → **Add workbook**.
-2. Open the **Advanced editor** (`</>`).
-3. Paste the contents of the `.workbook.json` file, click **Apply**, then **Save**.
-
-Each workbook's README lists the diagnostic settings and data connectors it depends on. Check those first: missing tables render as empty panels, not errors.
 
 ## Contributing
 
-Issues and pull requests are welcome, whether they're query improvements, false-positive tuning, or new workbooks. New workbooks should follow the layout above and include a README covering data requirements and known limitations.
+Issues and pull requests are welcome, whether it's a query fix, false-positive tuning or a new workbook. New workbooks should follow the layout above and include a README covering what data they need and where they fall short.
 
 ## Disclaimer
 
-Provided as-is, with no warranty. These are hunting aids, not validated detections. Test in your own tenant and tune allowlists and thresholds before acting on results or promoting queries to alerts.
+Provided as is, no warranty. These are hunting aids, not tested detections. Try them in your own tenant and tune them before acting on the results or turning them into alerts.
 
 ## License
 
